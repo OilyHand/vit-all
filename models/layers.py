@@ -349,18 +349,12 @@ def run_layernorm_hw(
     np.copyto(
         src_view[:, :N, :, :],
         data_b.reshape(B, N, NPARTS, PACK))
-    
-    # add = torch.ops.quantized.add(data_a, data_b, scale_c, zp_c)
-    # add_f = add.dequantize()
-    
-    # result = F.layer_norm(add_f, normalized_shape=(768,),
-    #                       weight=weight, bias=bias,
-    #                       eps=1e-6)
-
 
     # read weight
     ln_ip.write(0x10, 0x02)
     ln_ip.write(0x00, 0x01)
+    
+    time.sleep(0.00001)
     
     # update registers
     ln_ip.write(0x10, mode)
@@ -378,14 +372,12 @@ def run_layernorm_hw(
     ln_ip.write(0x90, dst_addr)
     
     ln_ip.write(0x00, 0x01)
-    while ln_ip.read(0x00) & 0x02:
+    while not ln_ip.read(0x00) & 0x02:
         pass
 
     np.copyto(
         hw.ln_result_buf.reshape(B, N, NPARTS, PACK),
         dst_view[:, :N, :, :])
-    
-    # return torch.quantize_per_tensor(result, scale_o, zp_o, torch.quint8)
 
     return torch._make_per_tensor_quantized_tensor(
         hw.ln_result_torch, scale_o, zp_o)
