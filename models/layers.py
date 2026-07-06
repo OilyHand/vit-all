@@ -5,7 +5,10 @@ from torch.ao.nn.quantized import FloatFunctional
 import numpy as np
 import copy
 import struct
-from pynq import MMIO
+from pynq import MMIO, allocate
+from config.config import SCALE, HIDDEN_DIM, SEQ_LEN, BATCH_SIZE
+import os, mmap, threading, time
+
 # ==============================================================================
 #  [Import Utils]
 # ------------------------------------------------------------------------------
@@ -38,30 +41,14 @@ class BRAMBuffer:
     def flatten(self, *args, **kwargs):
         return self._arr.flatten(*args, **kwargs)
 
-
-try:
-    from pynq import Overlay, allocate
-    from utils.layernorm import layernorm_impl, layernorm_sim
-except ImportError:
-    print("[Warning] Device cannot support PYNQ library.")
-    Overlay, allocate = None, None
-    from utils.layernorm import layernorm_sim
-
-from config.config import SCALE, HIDDEN_DIM, SEQ_LEN, BATCH_SIZE
-import os, mmap
-
-import os, mmap
-import numpy as np
-import os, threading, time
-
 class BufferManager:
     ACP_START    = 0x58000000
     ACP_END      = 0x5A000000
     WEIGHT_START = 0x5A000000
 
     def __init__(self):
-        self._pre_acp_dummies  = []  # 0x37A0_0000 ~ 0x38000000
-        self._post_acp_dummies = []  # 0x3A000000  ~ 0x40000000
+        self._pre_acp_dummies  = []
+        self._post_acp_dummies = []
 
     def reserve_pre_acp(self):
         """CMA를 0x38000000 직전까지 채움"""
@@ -243,44 +230,16 @@ class FPGAManager:
                 self.v_all_np,
                 shape=(self.batch_size, self.num_heads, 64//16, row_nums, 16),
                 strides=(
-                    self.num_heads * self._V_slot_aligned,  # B
-                    self._V_slot_aligned,                    # heads
-                    row_nums*16,                                # N
-                    16,                                      # d_k//16
-                    1                                        # 16
+                    self.num_heads * self._V_slot_aligned,
+                    self._V_slot_aligned,
+                    row_nums*16,
+                    16,
+                    1
                 )
             )
 
-################################################ P ##################################
-            self.slot_P         = row_nums * row_nums          # 208*208 = 43264 = 0xA900
-            #self.slot_P_aligned = math.ceil(self.slot_P / 4096) * 4096  # 45056 = 0xB000
-
-            self.slots_P = BATCH_SIZE * 12  # 24
-            '''
-            self.ip_buf_mm_P_all = allocate(
-                shape=(self.slots_P * self.slot_P,),
-                dtype=np.int8   # ACP 범위, cacheable=True
-            )
-
-            # torch strided view (padding 포함, 4KB 정렬)
-            P_all_torch = torch.from_numpy(
-                np.asarray(self.ip_buf_mm_P_all)
-            )
-
-            # uint8이라 stride 단위 = bytes
-            self.P_strided = torch.as_strided(
-                P_all_torch,
-                size=(BATCH_SIZE,12, row_nums, row_nums),
-                stride=(12*self.slot_P,self.slot_P, row_nums, 1)  # 45056 byte 간격
-            )
-
-            # TPU 주소 (4KB 정렬 확인)
-            self.ip_buf_mm_P_list = [
-                PhysAddr(device_address=
-                    self.ip_buf_mm_P_all.device_address + i * self.slot_P)
-                for i in range(self.slots_P)
-            ]
-            '''
+            self.slot_P  = row_nums * row_nums
+            self.slots_P = BATCH_SIZE * 12
 
             self.ip_buf_mm_P_list = [
                 PhysAddr(...) for i in range(self.slots_P)  # 24개
@@ -321,30 +280,37 @@ class FPGAManager:
 
             batch = BATCH_SIZE
 
-            self.ip_buf_inp = allocate(shape=(batch*SEQ_LEN_PAD*HIDDEN_DIM,),
+            self.data_a_buf = allocate(shape=(batch*SEQ_LEN_PAD*HIDDEN_DIM,),
                                        dtype=np.uint8, cacheable=False)
-            self.ip_buf_par = allocate(shape=(HIDDEN_DIM*2,),
+            self.data_b_buf = allocate(shape=(batch*SEQ_LEN_PAD*HIDDEN_DIM,),
+                                       dtype=np.uint8, cacheable=False)
+            self.data_c_buf = allocate(shape=(batch*SEQ_LEN_PAD*HIDDEN_DIM,),
+                                       dtype=np.uint8, cacheable=False)
+            self.param_buf  = allocate(shape=(HIDDEN_DIM*2,),
                                        dtype=np.float32, cacheable=False)
-            self.ip_buf_out = allocate(shape=(batch*SEQ_LEN_PAD*HIDDEN_DIM,),
-                                       dtype=np.uint8, cacheable=False)
+            
+            self.data_a_np = np.asarray(self.data_a_buf).reshape(
+                batch, NPARTS, SEQ_LEN_PAD, PACK)
+            self.data_b_np = np.asarray(self.data_b_buf).reshape(
+                batch, NPARTS, SEQ_LEN_PAD, PACK)
+            self.data_c_np = np.asarray(self.data_c_buf).reshape(
+                batch, NPARTS, SEQ_LEN_PAD, PACK)
 
-            self.inp_buf_hw = np.asarray(self.ip_buf_inp).reshape(
-                batch, NPARTS, SEQ_LEN_PAD, PACK
-            )
-            self.out_buf_hw = np.asarray(self.ip_buf_out).reshape(
-                batch, NPARTS, SEQ_LEN_PAD, PACK
-            )
+            self.data_a__view = self.data_a_buf.transpose(0, 2, 1, 3)
+            self.data_b__view = self.data_b_buf.transpose(0, 2, 1, 3)
+            self.data_c__view = self.data_c_buf.transpose(0, 2, 1, 3)
 
-            self.inp_data_view = self.inp_buf_hw.transpose(0, 2, 1, 3)
-            self.out_data_view = self.out_buf_hw.transpose(0, 2, 1, 3)
-
-            self.par_buf_np = np.asarray(self.ip_buf_par)
+            self.param_buf_np = np.asarray(self.param_buf)
 
             self.ln_result_buf   = np.empty((batch, SEQ_LEN, HIDDEN_DIM), dtype=np.uint8)
             self.ln_result_torch = torch.from_numpy(self.ln_result_buf)
 
-            ln_ip                     = self.ip_ol.layernorm_0
-            ln_ip.register_map.inp_0  = self.ip_buf_inp.device_address
+            ln_ip = self.ip_ol.layernorm_0
+            ln_ip.write()
+            
+            ln_ip.register_map.inp_a  = self.ip_buf_inp.device_address
+            ln_ip.register_map.inp_a  = self.ip_buf_inp.device_address
+            ln_ip.register_map.inp_a  = self.ip_buf_inp.device_address
             ln_ip.register_map.par_0  = self.ip_buf_par.device_address
             ln_ip.register_map.out_0  = self.ip_buf_out.device_address
             ln_ip.register_map.batch  = batch
@@ -358,49 +324,23 @@ class FPGAManager:
         pass
 
 
+    #      ###  #   # ##### ####  #   #  ###  ####  #   # 
+    #     #   #  # #  #     #   # ##  # #   # #   # ## ## 
+    #     #####   #   ####  ####  # # # #   # ####  # # # 
+    #     #   #   #   #     #  #  #  ## #   # #  #  #   # 
+    ##### #   #   #   ##### #   # #   #  ###  #   # #   # 
 
-def requantize(tensor, dtype=torch.qint8):
-    min_val = tensor.min().item()
-    max_val = tensor.max().item()
-    
-    if dtype == torch.quint8:
-        q_min, q_max = 0, 255
-    elif dtype == torch.qint8:
-        q_min, q_max = -128, 127
-    
-    if min_val == max_val:
-        scale = 1.0
-        zero_point = 0
-    else:
-        min_val = min(min_val, 0.0)
-        max_val = max(max_val, 0.0)
-
-        scale = (max_val - min_val) / (q_max - q_min)
-
-        initial_zero_point = q_min - min_val / scale
-        zero_point = int(round(initial_zero_point))
-
-        if zero_point < q_min: 
-            zero_point = q_min
-        if zero_point > q_max:
-            zero_point = q_max
-    
-    return float(scale), int(zero_point)
-
-# ==============================================================================
-#  [Custom Layer Normalization Class]
-# ------------------------------------------------------------------------------
-def write_float_reg(ip, reg_name: str, value: float) -> None:
-    bits = struct.unpack('<I', struct.pack('<f', float(value)))[0]
-    reg = getattr(ip.register_map, reg_name)
-    ip.write(reg.address, bits)
+def float_packint(value):
+    return struct.unpack('<I', struct.pack('<f', float(value)))[0]
 
 def run_layernorm_hw(
     hw,
     x,
     eps,
-    out_scale,
-    out_zp
+    scale_a, zp_a,
+    scale_b, zp_b,
+    scale_c, zp_c,
+    scale_o, zp_o,
 ):
     orig_dtype = x.dtype
     B, N, C    = x.shape
@@ -409,19 +349,12 @@ def run_layernorm_hw(
     in_zp    = int(x.q_zero_point())
 
     ln_ip = hw.ip_ol.layernorm_0
-
     q_inp = x.int_repr().numpy()
 
     np.copyto(
         hw.inp_data_view[:, :N, :, :],
         q_inp.reshape(B, N, NPARTS, PACK)
     )
-
-    write_float_reg(ln_ip, 'in_scale',  in_scale)
-    write_float_reg(ln_ip, 'out_scale', float(out_scale))
-    write_float_reg(ln_ip, 'eps',       eps)
-    ln_ip.register_map.in_zp  = in_zp
-    ln_ip.register_map.out_zp = out_zp
 
     ln_ip.register_map.CTRL.AP_START = 1
     while not ln_ip.register_map.CTRL.AP_DONE:
@@ -433,10 +366,65 @@ def run_layernorm_hw(
     )
 
     return torch._make_per_tensor_quantized_tensor(
-        hw.ln_result_torch,   # (B, SEQ_LEN, HIDDEN_DIM) uint8, torch와 zero-copy 공유
+        hw.ln_result_torch,
         float(out_scale),
-        int(out_zp)
-    )
+        int(out_zp))
+
+
+class fusedResidualLayerNorm(nn.Module):
+    def __init__(
+        self,
+        normalized_shape,
+        eps,
+        hw,
+        scale_a, zp_a,
+        scale_b, zp_b,
+        scale_c, zp_c,
+        scale_o, zp_o,
+    ):
+        self.normalized_shape = normalized_shape
+        self.eps              = eps
+        self.hw               = hw
+        
+        # add input
+        self.scale_a, self.zp_a = scale_a, zp_a
+        self.scale_b, self.zp_b = scale_b, zp_b
+        
+        # add output === layernorm input
+        self.scale_c, self.zp_c = scale_c, zp_c
+        
+        # layernorm output
+        self.scale_o, self.zp_o = scale_o, zp_o
+        
+        # layernorm parameters
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias   = nn.Parameter(torch.zeros(normalized_shape))
+        
+        # layernorm parameters numpy
+        self._weight_np = None
+        self._bias_np   = None
+
+    def sync_params(self):
+        self._weight_np = self.weight.detach().cpu().numpy().astype(np.float32)
+        self._bias_np   = self.bias.detach().cpu().numpy().astype(np.float32)
+
+    def forward(self, x):
+        if self._weight_np is None:
+            self.sync_params()
+
+        C = self.normalized_shape[0]
+        np.copyto(self.hw.par_buf_np[:C], self._weight_np)
+        np.copyto(self.hw.par_buf_np[C:], self._bias_np)
+
+        out_tensor = run_layernorm_hw(
+            self.hw,
+            x,
+            self.eps,
+            self.out_scale,
+            self.out_zp,
+        )
+
+        return out_tensor
 
 
 class QuantLayerNormFPGA(nn.Module):

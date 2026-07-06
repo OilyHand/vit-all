@@ -1,4 +1,5 @@
-import torch
+import torch, torchvision
+from   torch.utils.data import DataLoader, Subset
 import glob
 import argparse
 import time
@@ -11,7 +12,6 @@ from pynq import Overlay, MMIO, allocate
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import config
-from data import get_dataloaders
 from models import FPGAManager, get_quant_model, tpu_gemm
 from models import *
 from models.layers import replace_ln_to_fpga
@@ -40,30 +40,27 @@ def make_post_hook(name):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ViT INT8 Inference Script")
-    parser.add_argument("--model_path", type=str, default="models/CUS_ViT_QAT_int8_converted.pt", help="Path to the converted INT8 checkpoint")
-    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE,                      help="Batch size for inference")
-    parser.add_argument("--device",     type=str, default="cpu",                                  help="Device to run inference on (cpu/cuda)")
-    parser.add_argument("--log_path",   type=str, default="./log/infer_int8.csv",                 help="Path to save inference logs")
-    parser.add_argument("--use_hw",     action="store_true", help="Enable FPGA Hardware Acceleration")
+    parser.add_argument("--model_path", type=str, default="models/vit_qat_int8_custom.pt", help="Path to the converted INT8 checkpoint")
+    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE,               help="Batch size for inference")
+    parser.add_argument("--device",     type=str, default="cpu",                           help="Device to run inference on (cpu/cuda)")
+    parser.add_argument("--log_path",   type=str, default="./log/infer_int8.csv",          help="Path to save inference logs")
+    parser.add_argument("--use_hw",     action="store_true",                               help="Enable FPGA Hardware Acceleration")
     parser.add_argument("--hw_path", type=str, default="./hardware/TB_TPU_BD_wrapper.xsa", help="Path to hardware xsa file")
     return parser.parse_args()
 
-BASE = 0xA000_0000
-MMIO_RANGE = 0x1000
-CSRA_CONTROL   = 0x00
-SA_SOURCE1     = 0x04
-SA_SOURCE2     = 0x08
-SA_CONT1       = 0x0C
-SA_CONT2       = 0x10
-SA_DESTINATION = 0x14
-IRQ_CLEAR_OFF   = None   # 예: 0x38
+BASE            = 0xA000_0000
+MMIO_RANGE      = 0x1000
+CSRA_CONTROL    = 0x00
+SA_SOURCE1      = 0x04
+SA_SOURCE2      = 0x08
+SA_CONT1        = 0x0C
+SA_CONT2        = 0x10
+SA_DESTINATION  = 0x14
+IRQ_CLEAR_OFF   = None
 IRQ_CLEAR_VALUE = 0x1 
 
 if __name__ == "__main__":
-    print("start main")
     args = parse_args()
-    TPU1 = MMIO(BASE, MMIO_RANGE)
-    uio_list = glob.glob("/dev/uio*")
 
     # -------------------------------------------------------------------------
     # 1. Setup Environment
@@ -71,41 +68,56 @@ if __name__ == "__main__":
     device = torch.device(args.device)
     print(f"[Init] Device: {device}")
     print(f"[Init] Loading Model from: {args.model_path}")
-    print(f"[Init] Hardware Acceleration: {'ENABLED' if args.use_hw else 'DISABLED'}")
-    
-    # 로그 디렉토리 생성
-    os.makedirs(os.path.dirname(args.log_path), exist_ok=True)
     
     # -------------------------------------------------------------------------
     # 2. Load Data
     # -------------------------------------------------------------------------
-    # configs/config.py의 설정을 따르거나 args로 오버라이드 가능
-    # 여기서는 get_dataloaders 내부 구현에 따라 배치 사이즈 전달
-    _, _, test_loader = get_dataloaders(batch_size=args.batch_size)
-    print(f"[Data] Test dataset size: {len(test_loader.dataset)}")
+    preprocess = torchvision.transforms.Compose([
+        torchvision.transforms.Resize((224, 224)),
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize((0.5071, 0.4867, 0.4408), 
+                                         (0.2675, 0.2565, 0.2761))
+    ])
+
+    test_set = torchvision.datasets.CIFAR100(
+        root="./data",
+        train=False,
+        download=False,
+        transform=preprocess)
+
+    indices = list(range(4096))
+    test_set = Subset(test_set, indices)
+
+    test_loader = DataLoader(
+        dataset=test_set,
+        batch_size=args.batch_size,
+        shuffle=False)
+
+    # -------------------------------------------------------------------------
+    # 3. Load Model
+    # -------------------------------------------------------------------------
+    # hw = FPGAManager(args.hw_path)
+    hw = None
+    model = get_quant_model(checkpoint_path=args.model_path,
+                            num_classes=100,
+                            qbackend="qnnpack",
+                            batch_size=args.batch_size,
+                            hw=hw,
+                            use_hw=args.use_hw,
+                            device=args.device)
     
-    # -------------------------------------------------------------------------
-    # 3. Load Model (INT8 + HW Options)
-    # -------------------------------------------------------------------------
-    hw = FPGAManager(args.hw_path)
+    traced = torch.fx.symbolic_trace(model)
+    breakpoint()
+    
+    for node in model.graph.nodes:
+        print(node.name, node.target)
+        breakpoint()
+
     try:
-        model = get_quant_model(checkpoint_path=args.model_path,
-                                num_classes=100,  # CIFAR-100
-                                qbackend="qnnpack",
-                                batch_size=args.batch_size,
-                                hw=hw,
-                                use_hw=args.use_hw,
-                                device=args.device)
-
         quantized_model = transform_mha_to_tpu(model, hw)
-
-        print("dbg point 6")
         quantized_model = transform_conv_to_tpu(quantized_model,hw)
-        print("dbg point 7")
         quantized_model = transform_quantized_model_to_tpu(quantized_model,hw)
-        print("dbg point 8")
         quantized_model = replace_ln_to_fpga(quantized_model, hw)
-        print("dbg point 9")
         
         del model
 
@@ -146,15 +158,11 @@ if __name__ == "__main__":
     correct = 0
     total = 0
     total_inference_time = 0.0
-    #breakpoint()
-# 로그 파일 헤더 작성
-    if not os.path.exists(args.log_path):
-        with open(args.log_path, 'w') as f:
-            f.write('Timestamp,Processed,Avg_Latency(ms),Accuracy\n')
+
     
     print("===============================================================")
     print(" ***             Starting Inference on TestSet             *** ")
-    print("====i===========================================================")
+    print("===============================================================")
 
 
     from pynq.pmbus import DataRecorder
@@ -216,14 +224,11 @@ if __name__ == "__main__":
                   f"INT: {power_int:.2f}W | "
                   f"1V2: {power_1v2:.2f}W | "
                   f"1V8: {power_1v8:.2f}W | ") 
-                # 파일 로그 저장
-                with open(args.log_path, 'a') as f:
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    f.write(f'{ts},{total},{avg_latency_sec:.4f},{current_acc:.4f}\n')
+
             # === 최종 block별 평균 출력 ===
             print("\n=== Per-block timing (avg) ===")
-            for name, _ in blocks_to_hook:       # ✅ blocks_to_hook 사용
-                ts = block_times[name]           # ✅ 문자열 키로 접근
+            for name, _ in blocks_to_hook:
+                ts = block_times[name]
                 if ts:
                     avg_ms = sum(ts) / len(ts) * 1000
                     print(f"  {name}: {avg_ms:.3f} ms")
@@ -262,67 +267,3 @@ if __name__ == "__main__":
     print(f" [Result] Avg Latency   : {final_avg_latency_ms:.4f} ms/sample")
     print(f" [Result] Total Time    : {total_inference_time:.4f} sec")
     print("===============================================================")
-    
-    # 최종 결과 로그 저장
-    with open(args.log_path, 'a') as f:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f'{ts},{total},{final_avg_latency_ms:.4f},{final_acc:.4f}\n')
-        print(f"[Info] Log saved to {args.log_path}")
-
-
-
-# with torch.inference_mode():
-#         pbar = tqdm(test_loader, desc="Inferencing", unit="batch")
-
-#         for batch_idx, (imgs, labels) in enumerate(pbar):
-#             imgs = imgs.to(device, non_blocking=True)
-#             labels = labels.to(device, non_blocking=True)
-#             print(batch_idx)
-
-#             # 시간 측정
-#             start_time = time.perf_counter()
-#             preds = model(imgs)
-#             end_time = time.perf_counter()
-
-#             # 배치 처리 시간 누적
-#             batch_time = end_time - start_time
-#             total_inference_time += batch_time
-
-#             # 정확도 계산
-#             pred_cls = preds.argmax(dim=1)
-#             correct += (pred_cls == labels).sum().item()
-#             total += labels.size(0)
-
-#             # 현재 정확도와 평균 레이턴시 표시
-#             current_acc = correct / total
-#             avg_latency_ms = (total_inference_time / total) * 1000
-
-#             pbar.set_postfix({
-#                 "Acc": f"{current_acc:.4f}", 
-#                 "AvgLat": f"{avg_latency_ms:.2f}ms"
-#             })
-
-#             # (선택) 주기적 로그 저장 - 예: 매 10 배치마다
-#             if (batch_idx + 1) % 10 == 0:
-#                 with open(args.log_path, 'a') as f:
-#                     ts = datetime.now().strftime("%H:%M:%S")
-#                     f.write(f'{ts},{total},{avg_latency_ms:.4f},{current_acc:.4f}\n')
-
-#     # -------------------------------------------------------------------------
-#     # 5. Final Report
-#     # -------------------------------------------------------------------------
-#     final_acc = correct / total
-#     final_avg_latency_ms = (total_inference_time / total) * 1000
-
-#     print("\n===============================================================")
-#     print(f" [Result] Final Accuracy: {final_acc:.4f} ({correct}/{total})")
-#     print(f" [Result] Avg Latency   : {final_avg_latency_ms:.4f} ms/sample")
-#     print(f" [Result] Total Time    : {total_inference_time:.4f} sec")
-#     print("===============================================================")
-
-#     # 최종 결과 로그 저장
-#     with open(args.log_path, 'a') as f:
-#         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#         f.write(f'{ts},{total},{final_avg_latency_ms:.4f},{final_acc:.4f}\n')
-
-#     print(f"[Info] Log saved to {args.log_path}")
