@@ -37,16 +37,12 @@ def get_quant_model(checkpoint_path, num_classes=100, qbackend="qnnpack", batch_
     quant_model_prepared = buildQuant(base_model, batch_size=batch_size, use_hw=False, qbackend=qbackend)
     quant_model_int8 = tq.quantize_fx.convert_fx(quant_model_prepared)
 
-    print("dbg point 4")
-
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
     
     state_dict = torch.load(checkpoint_path, map_location="cpu")
     quant_model_int8.load_state_dict(state_dict, strict=False)
     
-    print("dbg point 5")
-
     quant_model_int8.to(device).eval()
     
     return quant_model_int8

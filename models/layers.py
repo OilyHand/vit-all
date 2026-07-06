@@ -255,8 +255,6 @@ class FPGAManager:
 
         self._pv_result_view = self._pv_result_torch.reshape(BATCH_SIZE, 12, 208, 64)
 
-
-
         # Per-thread scratch buffers (사전할당, 평생 재사용)
         self._softmax_scratch_f32 = np.empty((4, 208, 208), dtype=np.float32)
         self._softmax_scratch_u8  = np.empty((4, 208, 208), dtype=np.uint8)
@@ -288,7 +286,7 @@ class FPGAManager:
 
         self.data_a_view = self.data_a_np.transpose(0, 2, 1, 3)
         self.data_b_view = self.data_b_np.transpose(0, 2, 1, 3)
-        self.data_c_view = self.data_c_np.transpose(0, 2, 1, 3)
+        self.data_c_view = self.data_c_np.transpose(0, 2, 1, 3) 
 
         self.param_buf_np = np.asarray(self.param_buf)
 
@@ -297,7 +295,7 @@ class FPGAManager:
 
         ln_ip = self.ip_ol.layernorm_0
         
-        ln_ip.register_map.par_0  = self.data_a_buf.device_address
+        ln_ip.register_map.par_0  = self.param_buf.device_address
         ln_ip.register_map.batch  = batch
         ln_ip.register_map.seqlen = SEQ_LEN
         ln_ip.register_map.dim    = HIDDEN_DIM
@@ -332,26 +330,45 @@ def run_layernorm_hw(
     scale_b, zp_b,
     scale_c, zp_c,
     scale_o, zp_o,
+    weight,
+    bias
 ):
-    ln_ip = hw.ip_ol.layernorm_0
+    # ln_ip = hw.ip_ol.layernorm_0
+    
+    print(f"A  : ({scale_a:.6f}, {zp_a})")
+    print(f"B  : ({scale_b:.6f}, {zp_b})")
+    print(f"C  : ({scale_c:.6f}, {zp_c})")
+    print(f"O  : ({scale_o:.6f}, {zp_o})")
+    print(f"INA: ({prev_out.q_scale():.6f}, {prev_out.q_zero_point()})")
+    if prev_in is not None:
+        print(f"INB: ({prev_in.q_scale():.6f}, {prev_in.q_zero_point()})")
+    
+    t0 = time.perf_counter()
     data_a = prev_out.int_repr().numpy()
-    data_b = prev_in.int_repr().numpy()
+    t1 = time.perf_counter()
+    
+    point1 = t1 - t0
     
     B = hw.batch_size
     N = 197
 
+    t0 = time.perf_counter()
+    
     np.copyto(
         hw.data_a_view[:, :N, :, :],
         data_a.reshape(B, N, NPARTS, PACK))
-    np.copyto(
-        src_view[:, :N, :, :],
-        data_b.reshape(B, N, NPARTS, PACK))
+
+    t1 = time.perf_counter()
+    
+    point2 = t1-t0
 
     # read weight
+    t0 = time.perf_counter()
+    
     ln_ip.write(0x10, 0x02)
     ln_ip.write(0x00, 0x01)
-    
-    time.sleep(0.00001)
+    while not ln_ip.read(0x00) & 0x02:
+        pass
     
     # update registers
     ln_ip.write(0x10, mode)
@@ -368,16 +385,38 @@ def run_layernorm_hw(
     ln_ip.write(0x80, src_addr)
     ln_ip.write(0x90, dst_addr)
     
+    t1 = time.perf_counter()
+    point3 = t1 - t0
+    
+    t0 = time.perf_counter()
     ln_ip.write(0x00, 0x01)
-    while not ln_ip.read(0x00) & 0x02:
+    while (ln_ip.read(0x00) & 0x02) == 0:
         pass
+    t1 = time.perf_counter()
+    
+    point4 = t1 - t0
 
     np.copyto(
         hw.ln_result_buf.reshape(B, N, NPARTS, PACK),
         dst_view[:, :N, :, :])
+    
+    print(f"point1: {point1*1000:.4f} | "
+          f"point2: {point2*1000:.4f} | "
+          f"point3: {point3*1000:.4f} | "
+          f"point4: {point4*1000:.4f}")
 
-    return torch._make_per_tensor_quantized_tensor(
+    out_fpga = torch._make_per_tensor_quantized_tensor(
         hw.ln_result_torch, scale_o, zp_o)
+    
+    if prev_in is not None:
+        add = torch.ops.quantized.add(prev_in, prev_out, scale_c, zp_c)
+        deq = add.dequantize()
+    else:
+        deq = prev_out.dequantize()
+    
+    out = F.layer_norm(deq, (768,), weight, bias)
+    
+    return torch.quantize_per_tensor(out, scale_o, zp_o, torch.quint8)
 
 
 class fusedResidualLayerNorm(nn.Module):
@@ -395,6 +434,7 @@ class fusedResidualLayerNorm(nn.Module):
         scale_c, zp_c,
         scale_o, zp_o,
     ):
+        super().__init__()
         self.normalized_shape = normalized_shape
         self.hw               = hw
         
@@ -424,6 +464,7 @@ class fusedResidualLayerNorm(nn.Module):
         self._bias_np   = None
 
     def sync_params(self):
+        print("parameters are synchronized")
         self._weight_np = self.weight.detach().cpu().numpy().astype(np.float32)
         self._bias_np   = self.bias.detach().cpu().numpy().astype(np.float32)
 
@@ -448,6 +489,8 @@ class fusedResidualLayerNorm(nn.Module):
             self.scale_b, self.zp_b,
             self.scale_c, self.zp_c,
             self.scale_o, self.zp_o,
+            self.weight,
+            self.bias
         )
 
         return out_tensor
@@ -460,18 +503,25 @@ def replace_ln_to_fpga(model, hw):
     dst_view = None
     
     for node in model.graph.nodes:
+        is_start = False
+        is_ln1 = False
+        is_ln2 = False
+        print(node.name)
         if "ln_1" in node.name and not "fpga" in node.name:
+            is_ln1 = True
             if "encoder_layer_0" in node.name:
+                is_start=True
                 src_addr = hw.data_b_buf.device_address
                 dst_addr = hw.data_b_buf.device_address
-                src_view = hw.data_b_buf.device_address
+                src_view = hw.data_b_view
                 dst_view = hw.data_b_view
                 mode     = 0x00
                 
                 scale_a = float(getattr(model, 
                                   node.args[0].args[0].args[2].target))
-                zp_a    = int(getattr(mode, 
+                zp_a    = int(getattr(model, 
                                   node.args[0].args[0].args[3].target))
+
                 scale_b, zp_b = 1.0, 0
                 scale_c, zp_c = 1.0, 0
                 
@@ -483,7 +533,7 @@ def replace_ln_to_fpga(model, hw):
                 mode     = 0x01
                 
                 inp_a_node = node.args[0].args[1].args[0]
-                inp_a_mod  = model.get_module(inp_a_node.target)
+                inp_a_mod  = model.get_submodule(inp_a_node.target)
                 add_node   = node.args[0]
                 
                 scale_a = float(inp_a_mod.scale)
@@ -492,28 +542,32 @@ def replace_ln_to_fpga(model, hw):
                 scale_b = scale_o
                 zp_b    = zp_o
                 
-                scale_c = float(getattr(model, add_node.args[2]))
-                zp_c    = int(getattr(model, add_node.args[3]))
+                scale_c = float(getattr(model, add_node.args[2].target))
+                zp_c    = int(getattr(model, add_node.args[3].target))
         
-        if "ln_2" in node.name and not "fpga" in node.name:
-                src_addr = hw.data_b_buf.device_address
-                dst_addr = hw.data_c_buf.device_address
-                src_view = hw.data_b_view
-                dst_view = hw.data_c_view
-                mode     = 0x01
-                
-                inp_a_node = node.args[0].args[0].args[0].args[0]
-                inp_a_mod  = model.get_module(inp_a_node.target)
-                add_node   = node.args[0]
-                
-                scale_a = inp_a_mod.scale
-                zp_a    = inp_a_mod.zero_point
-                
-                scale_b = scale_o
-                zp_b    = zp_o
-                
-                scale_c = float(getattr(model, add_node.args[2]))
-                zp_c    = int(getattr(model, add_node.args[3]))
+        elif "ln_2" in node.name and not "fpga" in node.name:
+            is_ln2 = True
+            
+            src_addr = hw.data_b_buf.device_address
+            dst_addr = hw.data_c_buf.device_address
+            src_view = hw.data_b_view
+            dst_view = hw.data_c_view
+            mode     = 0x01
+            
+            inp_a_node = node.args[0].args[0].args[0].args[0]
+            inp_a_mod  = model.get_submodule(inp_a_node.target)
+            add_node   = node.args[0]
+            
+            scale_a = inp_a_mod.scale
+            zp_a    = inp_a_mod.zero_point
+            
+            scale_b = scale_o
+            zp_b    = zp_o
+            
+            scale_c = float(getattr(model, add_node.args[2].target))
+            zp_c    = int(getattr(model, add_node.args[3].target))
+        else:
+            continue
                 
         ln_module = model.get_submodule(node.target)
         
@@ -541,67 +595,45 @@ def replace_ln_to_fpga(model, hw):
         fpga_ln.weight.data.copy_(weight)
         fpga_ln.bias.data.copy_(bias)
         
-        node_prev_in  = node.args[0].args[0]
-        node_prev_out = node.args[0].args[1]
-
         new_module_name = f"fpga_layernorm_{node.name}"
         model.add_module(new_module_name, fpga_ln)
+        
+        if is_start:
+            with model.graph.inserting_after(node):
+                new_node = model.graph.call_module(
+                            new_module_name,
+                            args=(None,node.args[0],))
+                node.replace_all_uses_with(new_node)
+        else:
+            if is_ln1:
+                node_prev_in  = add_node.args[0]
+                node_prev_out = add_node.args[1]
+            if is_ln2:
+                node_prev_in  = add_node.args[1]
+                node_prev_out = add_node.args[0]
 
-        with model.graph.inserting_after(node):
-            new_node = model.graph.call_module(
-                        new_module_name,
-                        args=(node_prev_in,node_prev_out,))
-            node.replace_all_uses_with(new_node)
+            with model.graph.inserting_after(node):
+                new_node = model.graph.call_module(
+                            new_module_name,
+                            args=(node_prev_in, node_prev_out,))
+                node.replace_all_uses_with(new_node)
 
-        model.graph.erase_node(node)
+        if is_start:
+            model.graph.erase_node(node)
+        else:
+            nodes = []
+            inode = node.args[0]
+            while inode.name != node.next.name:
+                nodes.append(inode)
+                inode = inode.next
+
+            for n in reversed(nodes):
+                if len(n.users) == 0:
+                    model.graph.erase_node(n)
 
     model.graph.lint()
     model.recompile()
     return model
-
-# class QuantLayerNormFPGA(nn.Module):
-#     def __init__(
-#         self,
-#         normalized_shape,
-#         eps: float = 1e-6,
-#         hw=None,
-#         out_scale: 'float | None' = None,
-#         out_zp: 'int | None' = None
-#     ):
-#         super().__init__()
-#         self.normalized_shape = normalized_shape
-#         self.eps              = eps
-#         self.hw               = hw
-#         self.out_scale        = out_scale
-#         self.out_zp           = out_zp
-
-#         self.weight = nn.Parameter(torch.ones(normalized_shape))
-#         self.bias   = nn.Parameter(torch.zeros(normalized_shape))
-
-#         self._weight_np: np.ndarray | None = None
-#         self._bias_np:   np.ndarray | None = None
-
-#     def sync_params(self):
-#         self._weight_np = self.weight.detach().cpu().numpy().astype(np.float32)
-#         self._bias_np   = self.bias.detach().cpu().numpy().astype(np.float32)
-
-#     def forward(self, x):
-#         if self._weight_np is None:
-#             self.sync_params()
-
-#         C = self.normalized_shape[0]
-#         np.copyto(self.hw.par_buf_np[:C], self._weight_np)
-#         np.copyto(self.hw.par_buf_np[C:], self._bias_np)
-
-#         out_tensor = run_layernorm_hw(
-#             self.hw,
-#             x,
-#             self.eps,
-#             self.out_scale,
-#             self.out_zp,
-#         )
-
-#         return out_tensor
 
 
 # ==============================================================================

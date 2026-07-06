@@ -57,7 +57,7 @@ SA_CONT1        = 0x0C
 SA_CONT2        = 0x10
 SA_DESTINATION  = 0x14
 IRQ_CLEAR_OFF   = None
-IRQ_CLEAR_VALUE = 0x1 
+IRQ_CLEAR_VALUE = 0x1
 
 if __name__ == "__main__":
     args = parse_args()
@@ -80,7 +80,7 @@ if __name__ == "__main__":
     ])
 
     test_set = torchvision.datasets.CIFAR100(
-        root="./data",
+        root="../",
         train=False,
         download=False,
         transform=preprocess)
@@ -123,12 +123,14 @@ if __name__ == "__main__":
         gc.collect()
 
     except Exception as e:
-        print(f"[Error] Failed to load model: {e}")
+        traceback.print_exc()
     
     except KeyboardInterrupt:
         del hw
         print("[Keyboard Interrupt] Exit")
         exit()
+        
+    breakpoint()
 
     # -------------------------------------------------------------------------
     # 4. Inference Loop
