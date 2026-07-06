@@ -296,11 +296,8 @@ class FPGAManager:
         self.ln_result_torch = torch.from_numpy(self.ln_result_buf)
 
         ln_ip = self.ip_ol.layernorm_0
-        ln_ip.write()
         
-        ln_ip.register_map.inp_a  = self.ip_buf_inp.device_address
-        ln_ip.register_map.par_0  = self.ip_buf_par.device_address
-        ln_ip.register_map.out_0  = self.ip_buf_out.device_address
+        ln_ip.register_map.par_0  = self.data_a_buf.device_address
         ln_ip.register_map.batch  = batch
         ln_ip.register_map.seqlen = SEQ_LEN
         ln_ip.register_map.dim    = HIDDEN_DIM
