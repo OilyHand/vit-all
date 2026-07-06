@@ -286,9 +286,9 @@ class FPGAManager:
         self.data_c_np = np.asarray(self.data_c_buf).reshape(
             batch, NPARTS, SEQ_LEN_PAD, PACK)
 
-        self.data_a_view = self.data_a_buf.transpose(0, 2, 1, 3)
-        self.data_b_view = self.data_b_buf.transpose(0, 2, 1, 3)
-        self.data_c_view = self.data_c_buf.transpose(0, 2, 1, 3)
+        self.data_a_view = self.data_a_np.transpose(0, 2, 1, 3)
+        self.data_b_view = self.data_b_np.transpose(0, 2, 1, 3)
+        self.data_c_view = self.data_c_np.transpose(0, 2, 1, 3)
 
         self.param_buf_np = np.asarray(self.param_buf)
 
