@@ -1,13 +1,12 @@
 from .layers import (
     QuantMultiheadAttention,
-    QuantLayerNormFPGA,
+    fusedResidualLayerNorm,
     FPGAManager
 )
 
 from .quantization import (
     buildQuant,
     replace_mha,
-    replace_ln,
     apply_mixed_sparsity_
 )
 

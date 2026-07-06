@@ -5,7 +5,7 @@ import torch.ao.quantization as tq
 from torch.ao.quantization import quantize_fx
 from torch.ao.quantization.qconfig_mapping import QConfigMapping
 
-from models.layers import QuantMultiheadAttention, QuantLayerNormFPGA
+from models.layers import QuantMultiheadAttention
 
 # ==============================================================================
 #  [Sparsity Utils]
@@ -107,30 +107,6 @@ def replace_mha(model: nn.Module, use_hw=False):
             replaced += 1
 
     return replaced
-
-def replace_ln(model: nn.Module, use_hw=False):
-    replaced = 0
-
-    for name, child in model.named_children():
-        replaced += replace_ln(child, use_hw)
-
-        if isinstance(child, nn.LayerNorm):
-            if isinstance(child, QuantLayerNormFPGA):
-                continue
-
-            new_ln = QuantLayerNormFPGA(
-                normalized_shape=child.normalized_shape,
-                eps=child.eps,
-                use_hw=use_hw
-            )
-
-            if child.weight is not None:
-                new_ln.weight.data = child.weight.data.clone()
-            if child.bias is not None:
-                new_ln.bias.data = child.bias.data.clone()
-            
-            setattr(model, name, new_ln)
-            replaced += 1
 
 
 # =========================================================================

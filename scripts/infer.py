@@ -12,7 +12,7 @@ from pynq import Overlay, MMIO, allocate
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import config
-from models import FPGAManager, get_quant_model, tpu_gemm
+from models import get_quant_model
 from models import *
 from models.layers import replace_ln_to_fpga
 
@@ -96,8 +96,8 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # 3. Load Model
     # -------------------------------------------------------------------------
-    # hw = FPGAManager(args.hw_path)
-    hw = None
+    hw = FPGAManager(args.hw_path)
+    # hw = None
     model = get_quant_model(checkpoint_path=args.model_path,
                             num_classes=100,
                             qbackend="qnnpack",
@@ -106,34 +106,30 @@ if __name__ == "__main__":
                             use_hw=args.use_hw,
                             device=args.device)
     
-    traced = torch.fx.symbolic_trace(model)
-    breakpoint()
+    # traced = torch.fx.symbolic_trace(model)
+    # breakpoint()
     
-    for node in model.graph.nodes:
-        print(node.name, node.target)
-        breakpoint()
+    # for node in model.graph.nodes:
+    #     print(node.name, node.target)
+    #     breakpoint()
 
     try:
-        quantized_model = transform_mha_to_tpu(model, hw)
-        quantized_model = transform_conv_to_tpu(quantized_model,hw)
-        quantized_model = transform_quantized_model_to_tpu(quantized_model,hw)
-        quantized_model = replace_ln_to_fpga(quantized_model, hw)
+        # model = transform_mha_to_tpu(model, hw)
+        # model = transform_conv_to_tpu(quantized_model,hw)
+        # model = transform_quantized_model_to_tpu(quantized_model,hw)
+        model = replace_ln_to_fpga(model, hw)
         
-        del model
-
         import gc
         gc.collect()
 
-        
-        print("dbg point A")
-        quantized_model = replace_ln_to_fpga(quantized_model, hw)
-
-        model = quantized_model
-
-    except FileNotFoundError:
-        print(f"[Error] Model file not found at {args.model_path}")
     except Exception as e:
         print(f"[Error] Failed to load model: {e}")
+    
+    except KeyboardInterrupt:
+        del hw
+        print("[Keyboard Interrupt] Exit")
+        exit()
+
     # -------------------------------------------------------------------------
     # 4. Inference Loop
     # -------------------------------------------------------------------------
@@ -141,7 +137,6 @@ if __name__ == "__main__":
 
     blocks_to_hook = []
     for name, module in model.named_modules():
-        # encoder.layers.encoder_layer_0, encoder.layers.encoder_layer_1, ...
         if re.match(r'^encoder\.layers\.encoder_layer_\d+$', name):
             blocks_to_hook.append((name, module))
 
@@ -165,20 +160,20 @@ if __name__ == "__main__":
     print("===============================================================")
 
 
-    from pynq.pmbus import DataRecorder
-    from pynq import get_rails
+    # from pynq.pmbus import DataRecorder
+    # from pynq import get_rails
 
-    rails = get_rails()
-    recorder = DataRecorder( rails['12V'].power, rails['INT'].power, rails['1V2'].power, rails['1V8'].power) 
+    # rails = get_rails()
+    # recorder = DataRecorder( rails['12V'].power, rails['INT'].power, rails['1V2'].power, rails['1V8'].power) 
 
-    with recorder.record(0.001):
-        time.sleep(2)  # 아무것도 안하는 상태
+    # with recorder.record(0.001):
+    #     time.sleep(2)  # 아무것도 안하는 상태
 
-        idle_df = recorder.frame
-        idle_12v = idle_df['12V_power'].mean()
-        idle_int = idle_df['INT_power'].mean()
-        idle_1v2 = idle_df['1V2_power'].mean()
-        idle_1v8 = idle_df['1V8_power'].mean()
+    #     idle_df = recorder.frame
+    #     idle_12v = idle_df['12V_power'].mean()
+    #     idle_int = idle_df['INT_power'].mean()
+    #     idle_1v2 = idle_df['1V2_power'].mean()
+    #     idle_1v8 = idle_df['1V8_power'].mean()
 
     try:
         with torch.inference_mode():
@@ -194,11 +189,11 @@ if __name__ == "__main__":
                 preds = model(imgs)
                 end_time = time.perf_counter()
             
-                df = recorder.frame
-                power_12v  = df['12V_power'].mean()   # 시스템 전체
-                power_int  = df['INT_power'].mean()   # PL 코어
-                power_1v2  = df['1V2_power'].mean()   # PS 코어
-                power_1v8  = df['1V8_power'].mean()   # IO
+                # df = recorder.frame
+                # power_12v  = df['12V_power'].mean()
+                # power_int  = df['INT_power'].mean()
+                # power_1v2  = df['1V2_power'].mean()
+                # power_1v8  = df['1V8_power'].mean()
                 
 
                 # 배치 처리 시간 누적
@@ -219,11 +214,11 @@ if __name__ == "__main__":
 
                 print(f"Acc: {current_acc:.4f} | "
                   f"AvgTime: {avg_latency_sec:.2f}ms | "
-                  f"BestTime: {best_latency:.2f}ms | "
-                  f"12V: {power_12v:.2f}W | "
-                  f"INT: {power_int:.2f}W | "
-                  f"1V2: {power_1v2:.2f}W | "
-                  f"1V8: {power_1v8:.2f}W | ") 
+                  f"BestTime: {best_latency:.2f}ms | ")
+                #   f"12V: {power_12v:.2f}W | "
+                #   f"INT: {power_int:.2f}W | "
+                #   f"1V2: {power_1v2:.2f}W | "
+                #   f"1V8: {power_1v8:.2f}W | ") 
 
             # === 최종 block별 평균 출력 ===
             print("\n=== Per-block timing (avg) ===")
@@ -239,8 +234,6 @@ if __name__ == "__main__":
                 print(f"\nAll blocks avg: {sum(all_block_times)/len(all_block_times)*1000:.3f} ms")
 
     except KeyboardInterrupt:
-        print("[Keyboard Interrupt] Deactivate Hardware ...")
-        hw.free()
         del hw
         print("[Keyboard Interrupt] Exit")
         exit()
@@ -249,9 +242,6 @@ if __name__ == "__main__":
         traceback.print_exc()
     
     finally:
-        # ============================================
-        # Hook 정리 (예외 발생해도 반드시 실행)
-        # ============================================
         for h in hooks:
             h.remove()
         print(f"\n[Cleanup] Removed {len(hooks)} hooks")

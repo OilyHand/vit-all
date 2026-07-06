@@ -6,8 +6,6 @@ import os
 
 from config import config
 from models.quantization import buildQuant
-from models.layers import QuantLayerNormFPGA, FPGAManager, replace_layernorm_to_fpga
-
 # =========================================================================
 # [1] Base Model Factory
 # =========================================================================
