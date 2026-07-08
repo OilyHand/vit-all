@@ -44,10 +44,10 @@ def preprocess_weight_for_tpu(weight_tensor, TRANS = True):
     if remainder != 0:
         padding_size = 16 - remainder
         # 가로 방향(axis=1)으로 0을 붙여줌
-        W = np.pad(w_np, ((0, 0), (0, padding_size)), mode='constant', constant_values=0)    
-    
+        W = np.pad(w_np, ((0, 0), (0, padding_size)), mode='constant', constant_values=0)
+
     #print(f" - Original Shape (In, Out): ({w_np.shape})")
-    #print(f" - Padding Added: {W.shape} channels")    
+    #print(f" - Padding Added: {W.shape} channels")
 
     #blocks = []
     #for i in range(0, W.shape[1], 16):
@@ -106,7 +106,7 @@ def find_output_scale(node, model, debug=True):
 
 def find_input_scale(node, model):
     curr = node.args[0]
-    
+
     skip_ops = ['reshape', 'view', 'transpose',
                 'permute', 'contiguous', 'flatten']
     while curr is not None:
@@ -116,23 +116,23 @@ def find_input_scale(node, model):
 
         if curr.op == 'call_function':
             fname = str(curr.target)
-            
+
             # matmul 발견!
-            if 'matmul' in fname or 'quantize_per_tensor' in fname:                
+            if 'matmul' in fname or 'quantize_per_tensor' in fname:
                 scale = find_scale_in_args(curr.args, model)
                 if scale is not None:
                     return scale
-        
+
         if curr.op == 'call_module':
             submod = model.get_submodule(curr.target)
             if hasattr(submod, 'scale'):
                 return float(submod.scale)
-        
+
         if curr.op == 'get_attr':
             return float(model.get_buffer(curr.target))
-        
+
         curr = curr.args[0] if curr.args else None
-    
+
     return None
 
 def transform_quantized_model_to_tpu(model, hw):
@@ -165,14 +165,14 @@ def transform_quantized_model_to_tpu(model, hw):
         #input_submod = model.get_submodule(input_node.target)
         x_scale = input_scale
         # 확인
-        
+
         # 4. TPULinear 모듈 생성 및 가중치 로드
         tpu_linear = TPULinear(node.target,x_scale,weight, bias,out_scale,out_zp, hw)
 
         # 5. 모델에 등록 (이름은 중복 안 되게 유니크하게)
         tpu_module_name = f"tpu_{node.name}"
         setattr(model, tpu_module_name, tpu_linear)
-        
+
         # 6. 그래프 노드 교체 (설계도 수정)
         with graph.inserting_before(node):
             # 입력 노드를 명확히 지정 (튜플 형태 유지)
@@ -314,7 +314,7 @@ class TPUPatchEmbedding(nn.Module):
         self.patch_buf    = np.zeros((self.M, self.K), dtype=np.uint8)
         self.patches_buf = np.empty(
             (self.hw.batch_size * self.N, self.K), dtype=np.uint8
-        ) 
+        )
 
     def forward(self, x):
         """
@@ -328,19 +328,19 @@ class TPUPatchEmbedding(nn.Module):
         # ① int_repr
         ta = time.perf_counter()
         x_np = x.int_repr().cpu().numpy()
-        print(f"① int_repr: {(time.perf_counter()-ta)*1000:.2f}ms")
+        # print(f"① int_repr: {(time.perf_counter()-ta)*1000:.2f}ms")
 
         # ② im2col
         ta = time.perf_counter()
         patches = self._im2col(x_np)
         patches = patches.reshape(B * self.N, self.K)
-        print(f"② im2col: {(time.perf_counter()-ta)*1000:.2f}ms")
+        # print(f"② im2col: {(time.perf_counter()-ta)*1000:.2f}ms")
 
         # ③ 버퍼 복사
         ta = time.perf_counter()
         self.patch_buf[:self.M, :] = patches
         self.patch_buf[self.M:, :] = 0
-        print(f"③ buf copy: {(time.perf_counter()-ta)*1000:.2f}ms")
+        # print(f"③ buf copy: {(time.perf_counter()-ta)*1000:.2f}ms")
 
         # ④ memmove
         ta = time.perf_counter()
@@ -349,12 +349,12 @@ class TPUPatchEmbedding(nn.Module):
             self.patch_buf.ctypes.data,
             self.patch_buf.nbytes
         )
-        print(f"④ memmove: {(time.perf_counter()-ta)*1000:.2f}ms")
+        # print(f"④ memmove: {(time.perf_counter()-ta)*1000:.2f}ms")
 
         # ⑤ flush
         ta = time.perf_counter()
         self.hw.ip_buf_act.flush()
-        print(f"⑤ flush: {(time.perf_counter()-ta)*1000:.2f}ms")
+        # print(f"⑤ flush: {(time.perf_counter()-ta)*1000:.2f}ms")
 
         # ── ④ 인터럽트 준비 ────────────────────────────────────
         Interrupt_write(self.INTERRUPT1)
@@ -406,8 +406,8 @@ class TPUPatchEmbedding(nn.Module):
         )
 
         t3 = time.perf_counter()
-        print(f"PatchEmbed: total={(t3-t2)*1000:.1f}ms | gemm={(t2-t1)*1000:.1f}ms | preprocess : total={(t1-t0)*1000:.1f}ms")
-        
+        # print(f"PatchEmbed: total={(t3-t2)*1000:.1f}ms | gemm={(t2-t1)*1000:.1f}ms | preprocess : total={(t1-t0)*1000:.1f}ms")
+
         ########################################### method2 ####################################################
         #patches_i32 = patches.astype(np.int32) - int(in_zp)      # [B, 196, 768]
         #cpu_gemm = patches_i32 @ self.weight_T   # [B, 196, 768]
@@ -422,7 +422,7 @@ class TPUPatchEmbedding(nn.Module):
         #    zero_point = int(self.out_zp)
         #)
 
-        ######################################## method3 ##############################################    
+        ######################################## method3 ##############################################
         #x_dq = x.dequantize()
         #w_dq = self.weight_ori.dequantize()
         #cpu_out = torch.nn.functional.conv2d(
@@ -448,7 +448,7 @@ class TPUPatchEmbedding(nn.Module):
         #    zero_point = int(self.out_zp),
         #    dtype      = torch.quint8
         #)
-        
+
         # TPU 결과와 비교
         '''
         tpu_q = out_int.numpy().reshape(self.N, self.out_C)          # [196, 768]
@@ -636,17 +636,17 @@ class TPUMultiHeadAttention(nn.Module):
 
     MAX_OUT_FEATURES = 208
 
-    def __init__(self, qkv_module, proj_module, 
+    def __init__(self, qkv_module, proj_module,
                  qkv_act_scale,qkv_input_act_zero,proj_act_scale,
                  energy_scale, energy_zero,attention_input_scale, attention_input_zero, attention_output_scale, attention_output_zero, num_heads,  hw):
-        super().__init__()        
+        super().__init__()
         from pynq import Interrupt
         self.INTERRUPT1 = hw.ip_ol.axi_intc_0
         self.tpu_irq = Interrupt('TPU_PROCESSOR_3/interrupt')
         self.num_heads  = num_heads
         self.qkv        = qkv_module
         self.proj       = proj_module
-        self.hw         = hw    
+        self.hw         = hw
         self.original_row_nums = 197
         self.energy_scale = energy_scale
         self.energy_zero = energy_zero
@@ -663,13 +663,13 @@ class TPUMultiHeadAttention(nn.Module):
             max_workers=3
         )
 
-        self._attn_scale = float(1.0 / math.sqrt(self.d_k))        
+        self._attn_scale = float(1.0 / math.sqrt(self.d_k))
         '''
         self.qk_result_memory = np.empty(
             (B * self.num_heads, 208, 208), dtype=np.uint8)
         self._qk_result_torch = torch.from_numpy(self.qk_result_memory)
 
-        # PV 결과: [B, heads, N, d_k] = [2, 12, 208, 64]  
+        # PV 결과: [B, heads, N, d_k] = [2, 12, 208, 64]
         self.pv_result_memory = np.empty(
             (B * self.num_heads, 208, 64), dtype=np.uint8)
         self._pv_result_torch = torch.from_numpy(self.pv_result_memory)
@@ -691,13 +691,13 @@ class TPUMultiHeadAttention(nn.Module):
         self.k_out_features= k_module._packed_params._weight_bias()[0].shape[0]
         self.q_out_features= q_module._packed_params._weight_bias()[0].shape[0]
         self.v_out_features= v_module._packed_params._weight_bias()[0].shape[0]
-        self.k_shape = np.empty((self.hw.batch_size,12,64,208),dtype = np.int8) 
+        self.k_shape = np.empty((self.hw.batch_size,12,64,208),dtype = np.int8)
         # PROJ preprocess
         self.proj_src2_list, self.proj_src2_c_list, self.proj_param_buf_list = self._preprocess_weight(proj_module, proj_act_scale)
-        self.proj_out_features = proj_module._packed_params._weight_bias()[0].shape[0]        
+        self.proj_out_features = proj_module._packed_params._weight_bias()[0].shape[0]
 
         proj_num_rows         = self.hw.batch_size * 208
-        self.proj_padded_rows = (proj_num_rows) 
+        self.proj_padded_rows = (proj_num_rows)
         self.proj_padded_input = np.zeros((self.proj_padded_rows, 768), dtype=np.int8)
         self.proj_result_buf  = np.empty((proj_num_rows, self.proj_out_features), dtype=np.uint8)
         self.proj_result_torch = torch.from_numpy(self.proj_result_buf)
@@ -711,8 +711,8 @@ class TPUMultiHeadAttention(nn.Module):
         self.mha_result_torch = torch.from_numpy(self.mha_result_buf)
         self.mha_col_size = 768 // 4
 
-    
-    
+
+
         #Matmul preprocess
         self.combined_scale = float(self.energy_scale) * self._attn_scale
         self.attention_input_scale = attention_input_scale
@@ -728,20 +728,20 @@ class TPUMultiHeadAttention(nn.Module):
             attn_scale = attention_input_scale, # matmul_25 출력 scale
             attn_zp    = attention_input_zero,
             row_nums   = 208
-        ) 
-        
-        #softmax_process 
+        )
+
+        #softmax_process
         self._softmax_first_run = True
         self.inv_out_scale    = 1.0 /(float(self.attention_input_scale))
         self._valid_mask_scaled = torch.zeros(4, 208, 208)
-        #self._valid_mask_scaled[:, :197, :197] = self.inv_out_scale    
+        #self._valid_mask_scaled[:, :197, :197] = self.inv_out_scale
         self._valid_mask_scaled[:, :, :] = self.inv_out_scale
         self.combined_scale = float(self.energy_scale) * self._attn_scale
         self.p_zp_f         = float(self.energy_zero)
 
         self.neg_zp = np.uint8((256 - self.qkv.zero_point) & 0xFF)
         self.v3_buf_u8 = np.empty((self.hw.batch_size, 208, 768), dtype=np.uint8)
-        self.v3_buf_i8 = self.v3_buf_u8.view(np.int8) 
+        self.v3_buf_i8 = self.v3_buf_u8.view(np.int8)
         self.scale_128 = float( 128 * self.attention_input_scale  * self.qkv.scale / self.attention_output_scale)
 
     def _reorder_qkv_to_kqv(self, qkv_module):
@@ -750,7 +750,7 @@ class TPUMultiHeadAttention(nn.Module):
         w_scales = weight.q_per_channel_scales().detach().numpy()
         w_zp     = weight.q_per_channel_zero_points().detach().numpy()
         b_np     = bias.detach().cpu().numpy().astype(np.float32)
-        
+
         out_features = w_np.shape[0]
         chunk        = out_features // 3
 
@@ -777,7 +777,7 @@ class TPUMultiHeadAttention(nn.Module):
             module.scale       = qkv_module.scale
             module.zero_point  = qkv_module.zero_point
             module._packed_params._weight_bias = lambda: (w_tensor, b_tensor)
-            
+
             return module
         k_module = make_module(K_w, K_b, K_s, K_z)
         q_module = make_module(Q_w, Q_b, Q_s, Q_z)
@@ -788,11 +788,11 @@ class TPUMultiHeadAttention(nn.Module):
     def _preprocess_matmul_param(self, qkv_module, p_scale, p_zp, v_scale, attn_scale, attn_zp, row_nums):
         """
         Q@K^T (energy) 와 P@V (attention) 연산을 위한 param_buf 생성
-        
+
         energy (Q@K^T):
           M_scale = Q_scale * K_scale / P_scale
           bias    = 0
-        
+
         attention (P@V):
           M_scale = attn_scale * V_scale / out_scale
           bias    = 0
@@ -841,7 +841,7 @@ class TPUMultiHeadAttention(nn.Module):
             ]
 
         for i in range(self.hw.batch_size*12):
-            self.mm_attn_param_np[i] = interleaved_attn #broadcasting        
+            self.mm_attn_param_np[i] = interleaved_attn #broadcasting
         self.MM_attn_param_buf_all.flush()
 
 
@@ -911,7 +911,7 @@ class TPUMultiHeadAttention(nn.Module):
         in_features = x_2d.shape[1] #768 or 3072
         padded_rows = (num_rows + 15) // 16 * 16
 
-        if DATA_COPY == True:                        
+        if DATA_COPY == True:
             flat_data = x_2d.int_repr().cpu().numpy().flatten()
             num_elements = flat_data.size
             self.hw.ip_buf_act.flat[:num_elements] = flat_data
@@ -920,9 +920,9 @@ class TPUMultiHeadAttention(nn.Module):
             current_input = np.pad(current_input, ((0, pad_amt), (0, 0)), mode='constant', constant_values=0)
         # 인터럽트 감시 시작
         t1=time.perf_counter()
-        print(f"QKV_LINEAR1 time = {(t1-t0)*1000:.1f}ms")
+        # print(f"QKV_LINEAR1 time = {(t1-t0)*1000:.1f}ms")
         t0=time.perf_counter()
-        Interrupt_write(self.INTERRUPT1)        
+        Interrupt_write(self.INTERRUPT1)
         for i in range(4):
             tpu_node = getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}')
             run_sa(tpu_node,x_2d, self.hw.ip_buf_act.device_address, src2_list[i], src2_c_list[i], dst_list[i], param_buf_list[i],q_zero_point,self.qkv.zero_point)
@@ -931,7 +931,7 @@ class TPUMultiHeadAttention(nn.Module):
         start_time = time.perf_counter()
         tile_row_nums = src2_list[0].shape[1]
         tile_col_nums = x.shape[1]
-        B = x.shape[0]        
+        B = x.shape[0]
         results = [None] * 4
         done_mask = 0
         target_mask = 0b1111
@@ -964,7 +964,7 @@ class TPUMultiHeadAttention(nn.Module):
                     time.sleep(0.00005)
                     i=3
         t1=time.perf_counter()
-        print(f"QKV_LINEAR2 time = {(t1-t0)*1000:.1f}ms")
+        # print(f"QKV_LINEAR2 time = {(t1-t0)*1000:.1f}ms")
         t0=time.perf_counter()
         self.INTERRUPT1.write(0x0C, 0xF)
 
@@ -974,7 +974,7 @@ class TPUMultiHeadAttention(nn.Module):
             zero_point = int(self.qkv.zero_point)
         )
         t1=time.perf_counter()
-        print(f"QKV_LINEAR3 time = {(t1-t0)*1000:.1f}ms")
+        # print(f"QKV_LINEAR3 time = {(t1-t0)*1000:.1f}ms")
         return out_quant
 
     def TPU_PROJLinear(self, x):
@@ -1014,7 +1014,7 @@ class TPUMultiHeadAttention(nn.Module):
         actual_results_elements = padded_rows * self.proj_src2_list[0].shape[1]
 
         start_time = time.perf_counter()
-    
+
         while done_mask != target_mask:
             if (time.perf_counter() - start_time) > 5.0:
                 read_value = self.INTERRUPT1.read(0x00)
@@ -1024,7 +1024,7 @@ class TPUMultiHeadAttention(nn.Module):
 
             reg_val = self.INTERRUPT1.read(0x00)
             new_bits = reg_val & ~done_mask
-    
+
             if new_bits:
                 for i in range(4):
                     if new_bits & (1 << i):
@@ -1046,21 +1046,21 @@ class TPUMultiHeadAttention(nn.Module):
             zero_point = int(self.proj.zero_point)
         )
         t1=time.perf_counter()
-        print(f"PROJ_LINEAR time = {(t1-t0)*1000:.1f}ms")
+        # print(f"PROJ_LINEAR time = {(t1-t0)*1000:.1f}ms")
 
         return out_quant
-    
+
     def TPU_Matmul(self, a_shape, b_shape, a_zero_point, mode='QK'):
         """
         mode: 'QK' = Q@K^T → dequant + scale + softmax + 재양자화까지 처리
               'PV' = P@V → 결과 수집만
-        
+
         QK mode:
             - TPU matmul 후, 4 head를 thread pool로 병렬 처리
             - head별 fused pipeline: read → dequant → ×(1/√d_k) → softmax → quantize
             - 결과는 self.hw.ip_buf_mm_P_list (PV 입력)와 qk_result_memory에 write
             - return: softmax + quantize된 quantized tensor (attention_input scale/zp)
-        
+
         PV mode:
             - TPU matmul 후 결과만 copy
             - return: attention_output scale/zp로 wrap된 quantized tensor
@@ -1068,7 +1068,7 @@ class TPUMultiHeadAttention(nn.Module):
         # ─────────────────────────────────────────────
         # 0) Shape 및 공통 변수
         # ─────────────────────────────────────────────
-        t00 = time.perf_counter()     
+        t00 = time.perf_counter()
         B, heads, M, K = a_shape.shape
         N = b_shape.shape[-1]
         padded_rows = M
@@ -1081,29 +1081,29 @@ class TPUMultiHeadAttention(nn.Module):
             buf_list = self.hw.ip_buf_mm_Q_list
         else:
             raise ValueError(f"Unknown mode: {mode}")
-        
+
         # ─────────────────────────────────────────────
         # 1) QK mode 양자화 파라미터 미리 계산
         # ─────────────────────────────────────────────
         if mode == 'QK':
             # Dequant scale × attention scale (1/√d_k)을 곱셈 1번으로 합침
-            
+
             # ───── head별 처리 함수 (QK용, closure로 위 변수 캡쳐) ─────
-            
+
             def process_qk_head(group_):
-                t0 = time.perf_counter()                
+                t0 = time.perf_counter()
                 selected_group = group_%8
-                # ─ 2) numpy → torch 변환 ─                
+                # ─ 2) numpy → torch 변환 ─
                 ############################# softmax method1 ##########################################
-                
+
                 BRAM_BASE  = 0xB000_0000
                 H, W = 208, 208
                 group_size = H * W
-                
+
                 b       = group_ // 12
                 h_start = group_ % 12
                 src_addr = self.hw.ip_buf_mm_OCM_list[selected_group]
-                dst_addr = self.hw.ip_buf_mm_P_list[group_]                
+                dst_addr = self.hw.ip_buf_mm_P_list[group_]
                 if self._softmax_first_run:
                     # 첫번째는 그냥 바로 실행 (이전 작업 없음)
                     run_softmax(
@@ -1130,8 +1130,8 @@ class TPUMultiHeadAttention(nn.Module):
                         softmax_scale = struct.unpack('<I', struct.pack('<f', self.combined_scale))[0],
                         poll          = False,   # non-blocking
                     )
-         
-                
+
+
                 ############################## softmax method 2 #########################################
                 # 이미 BRAM을 직접 바라보는 view
                 #for i in range(4):
@@ -1151,32 +1151,32 @@ class TPUMultiHeadAttention(nn.Module):
                 #h_start = group_ % 12
                 #ref = t_in.to(torch.int8).cpu().numpy()
                 #wrong = np.where ( self.hw.P_strided[b, h_start:h_start+4] != ref )
-                #if len( wrong[0] ) >2:                
+                #if len( wrong[0] ) >2:
                 #    breakpoint()
                 #self.hw.P_strided[b, h_start:h_start+4].copy_(t_in.to(torch.int8).view(torch.uint8))
 
                 #############################################################################################
-                
+
         else:  # PV mode: 단순 copy만
             def process_pv_head(group_):
                 np.copyto(
                     self.hw.pv_result_memory[group_:group_+4, :208, :self.hw.d_k],
                     self.hw.q_strided[group_:group_+4, :208, :self.hw.d_k]
                 )
- 
+
         # ─────────────────────────────────────────────
         # 2) Group별 루프 (TPU 4개 동시 실행 + head 4개 병렬 후처리)
         # ─────────────────────────────────────────────
-    
-        futures = [] 
+
+        futures = []
         prev_group  = None
         self.tpu_nodes = [
-            getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}') 
+            getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}')
             for i in range(4)
         ]
-        q_addrs = [self.hw.ip_buf_mm_Q_list[h].device_address 
+        q_addrs = [self.hw.ip_buf_mm_Q_list[h].device_address
            for h in range(B * heads)]
-    
+
         # TPU_Matmul 시작 전에
         a_zp_int      = int(a_zero_point)
         energy_zp_int = int(self.energy_zero)
@@ -1191,9 +1191,9 @@ class TPUMultiHeadAttention(nn.Module):
             irq_future = asyncio.run_coroutine_threadsafe(
                 anext(interrupt_monitor(self.INTERRUPT1, num_events=4)),
                 self.hw.irq_loop
-            )   
-    
-            for i in range(4):            
+            )
+
+            for i in range(4):
                 head_idx = group + i
                 dst_idx = head_idx % 8
                 if mode == 'QK':
@@ -1204,7 +1204,7 @@ class TPUMultiHeadAttention(nn.Module):
                            self.hw.ip_buf_mm_KT_list[head_idx],
                            self.hw.ip_buf_mm_OCM_list[dst_idx],
                            self.MM_energy_param_buf_list[i],
-                           a_zp_int, int(self.energy_zero) )                   
+                           a_zp_int, int(self.energy_zero) )
                 else:  # PV
                     # ── 2) correction → MM_attn bias 버퍼에 삽입 ──
                     run_sa(self.tpu_nodes[i],
@@ -1228,22 +1228,22 @@ class TPUMultiHeadAttention(nn.Module):
             while (self.hw.ip_ol.softmax_module_0.read(0x50) >> 31) & 0x1:
                 time.sleep(0.0001)
             t1 = time.perf_counter()
-            print(f"softmax loop{group} time = {(t1-t0)*1000:.1f}ms") 
+            # print(f"softmax loop{group} time = {(t1-t0)*1000:.1f}ms")
 
-        
+
             if status is None:
                 breakpoint()
                 raise RuntimeError("TPU Timeout!")
             prev_group     = group
-        
+
         if prev_group is not None:
             if mode == 'QK':
-                process_qk_head(prev_group) 
+                process_qk_head(prev_group)
             else:
                 process_pv_head(prev_group)
 
-        t11 = time.perf_counter()        
-        print(f"Total_MATMUL({mode}) time = {(t11-t00)*1000:.1f}ms")
+        t11 = time.perf_counter()
+        # print(f"Total_MATMUL({mode}) time = {(t11-t00)*1000:.1f}ms")
 
         t0 = time.perf_counter()
 
@@ -1266,7 +1266,7 @@ class TPUMultiHeadAttention(nn.Module):
                 zero_point = int(self.attention_output_zero)
             )
         t1 = time.perf_counter()
-        print(f"softmax loop last time = {(t1-t0)*1000:.1f}ms")        
+        # print(f"softmax loop last time = {(t1-t0)*1000:.1f}ms")
         return out_quant
 
 
@@ -1317,7 +1317,7 @@ class TPUMultiHeadAttention(nn.Module):
         self.hw.ip_buf_mm_KT_all.flush()
 
         timings['memmove'] = (time.perf_counter() - t) * 1000
-        
+
         total = sum(timings.values())
         #print(f"preprocess_k {total:.1f}ms | " +
         #      " ".join(f"{k}={v:.1f}" for k, v in timings.items()))
@@ -1346,7 +1346,7 @@ class TPUMultiHeadAttention(nn.Module):
         self.hw.ip_buf_mm_Q_all.flush()
         t1 = time.perf_counter()
         #print(f"preprocess_q {(t1-t0)*1000:.2f}ms")
-        return q3  # [B, 12, N, 64] 
+        return q3  # [B, 12, N, 64]
 
     def preprocess_v(self, v_raw, x_shape):
         t = time.perf_counter()
@@ -1360,13 +1360,13 @@ class TPUMultiHeadAttention(nn.Module):
         #v3_np = (self.v_concat_memory[:, :N, :] + neg_zp).view(np.int8)
         #print(f"  1.dtype:      {(time.perf_counter()-t)*1000:.1f}ms")
         t = time.perf_counter()
- 
+
         # [B, N, 768] → [B, N, heads, d_k] → [B, heads, N, d_k//16, 16]
         t1=time.perf_counter()
         #print(f"MHA_3_2 time = {(t1-t0)*1000:.1f}ms")
         t0=time.perf_counter()
         v_for_sum = v3_np.reshape(self.hw.batch_size, N, self.hw.num_heads, 64) #(2,208,12,64)
-       
+
         #v_sum = v_for_sum.astype(np.float32).sum(axis=1)
         v_sum = v_for_sum.sum(axis=1, dtype=np.int32)
         correction = (v_sum * self.scale_128).reshape(B*self.hw.num_heads,64)
@@ -1390,7 +1390,7 @@ class TPUMultiHeadAttention(nn.Module):
             v_np.transpose(0, 2, 1, 3)              # [2,12,208,64]
             .reshape(self.hw.batch_size, self.hw.num_heads, N_pad, 4, 16)  # [2,12,208,4,16]
             .transpose(0, 1, 3, 2, 4)              # [2,12,4,208,16]
-        )        
+        )
 
         np.copyto(self.hw.v_strided, v_src)
         #print(f"  3.flush1:     {(time.perf_counter()-t)*1000:.1f}ms")
@@ -1400,7 +1400,7 @@ class TPUMultiHeadAttention(nn.Module):
         self.hw.ip_buf_mm_V_all.flush()
         #print(f"  5.flush2:     {(time.perf_counter()-t)*1000:.1f}ms")
         t = time.perf_counter()
-        
+
         return torch.from_numpy(v_np.transpose(0, 2, 1, 3))  # [B, heads, N, d_k]
 
     import ctypes
@@ -1421,7 +1421,7 @@ class TPUMultiHeadAttention(nn.Module):
         scale= d_k ** -0.5
         q_zero_point = x.q_zero_point()
         #qkv = self.qkv(x)
-        #breakpoint() 
+        #breakpoint()
         #qkv_f = qkv.dequantize()
         #qkv_f = qkv_f.reshape(B, N, 3, self.num_heads, d_k)
         #qkv_f = qkv_f.permute(2, 0, 3, 1, 4)
@@ -1429,14 +1429,14 @@ class TPUMultiHeadAttention(nn.Module):
         #q,k,v: [B, heads, N, d_k]
         #v2 = v2.reshape(B, N, self.num_heads, d_k).permute(0, 2, 1, 3)
 
-        if N%16 !=0:    
+        if N%16 !=0:
             N=(N+15)//16 * 16
             pad_amt = N - x.shape[1] # 200 - 197 = 3
             x = x.int_repr()
             x = np.pad(x, ((0,0), (0, pad_amt), (0, 0)), mode='constant', constant_values=q_zero_point)
 
         # ── 1. QKV Linear (TPU) ───────────────────
-        thread_results ={}    
+        thread_results ={}
         import ctypes
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,  # dst
@@ -1444,7 +1444,7 @@ class TPUMultiHeadAttention(nn.Module):
             x.nbytes                           # size
         )
         t1=time.perf_counter()
-        print(f"acivation move time = {(t1-t0)*1000:.1f}ms")
+        # print(f"acivation move time = {(t1-t0)*1000:.1f}ms")
         t0=time.perf_counter()
 
         k2 = self.TPU_QKVLinear(x, 'k',q_zero_point)
@@ -1456,9 +1456,9 @@ class TPUMultiHeadAttention(nn.Module):
 
         v2 = self.TPU_QKVLinear(x, 'v',q_zero_point)  # K,Q preprocess와 overlap!
         vt_thread = self._head_pool.submit(self.preprocess_v_wrapper, v2, v2.shape)
- 
+
         k_shape=kt_thread.result()
-        q_shape= qt_thread.result()        
+        q_shape= qt_thread.result()
         # ── 3. Q @ K^T (CPU torch.matmul) ─────────
         #combined = torch.cat([q2,k2,v2] , dim=-1)
         #wrong = torch.where(qkv != combined[:, :197, :])
@@ -1470,7 +1470,7 @@ class TPUMultiHeadAttention(nn.Module):
         #k=k.reshape(B, 208, self.num_heads, self.d_k).permute(0, 2, 1, 3)
         #qq=qq.reshape(B, 208, self.num_heads, self.d_k).permute(0, 2, 1, 3)
         #v=v.reshape(B, 208, self.num_heads, self.d_k).permute(0, 2, 1, 3)
-        #attn2 = torch.matmul(qq, k.transpose(-2, -1))        
+        #attn2 = torch.matmul(qq, k.transpose(-2, -1))
         #attn2 = attn2.dequantize() * scale
         # ── 4. softmax (CPU) ──────────────────────
         #attn2 = attn2.softmax(dim=-1)
@@ -1481,10 +1481,10 @@ class TPUMultiHeadAttention(nn.Module):
         #self.hw.P_strided.copy_(
         #    (attn2)
         #)
-        #self.hw.ip_buf_mm_P_all.flush() 
+        #self.hw.ip_buf_mm_P_all.flush()
         #t2 = time.perf_counter()
         t1=time.perf_counter()
-        print(f"QKV_Linear time = {(t1-t0)*1000:.1f}ms")
+        # print(f"QKV_Linear time = {(t1-t0)*1000:.1f}ms")
         t0=time.perf_counter()
         # --TPU Q@ K^T + SOFTMAX----------------------------------------
         attn = self.TPU_Matmul(q_shape,self.k_shape,q2.q_zero_point())
@@ -1509,11 +1509,11 @@ out = torch.clamp( torch.round(out / self.attention_input_scale) + self.attentio
 attn2[0][0].to(torch.int8)-self.p_zp)*self.p_scale
         '''
         t1=time.perf_counter()
-        print(f"Q*KT+SOFTMAX time = {(t1-t0)*1000:.1f}ms")
+        # print(f"Q*KT+SOFTMAX time = {(t1-t0)*1000:.1f}ms")
         t0=time.perf_counter()
         v_shape = vt_thread.result()
         # ── 5. P @ V (CPU torch.matmul) ───────────
-        #x = torch.matmul(attn.dequantize(), v_shape*self.qkv.scale)  # [B, heads, N, d_k]        
+        #x = torch.matmul(attn.dequantize(), v_shape*self.qkv.scale)  # [B, heads, N, d_k]
         #x = x.transpose(1, 2).contiguous()
         #x = x.reshape(B, N, C)    # [B, N, C]
         # ── 7. proj Linear (TPU) ──────────────────
@@ -1521,8 +1521,8 @@ attn2[0][0].to(torch.int8)-self.p_zp)*self.p_scale
         #x = torch.quantize_per_tensor(     x,   scale      = float(self.attention_output_scale),     zero_point = int(self.attention_output_zero),        dtype      = torch.quint8     )
 
 
-        #attn.dequantize()[0][0]@(v_shape*self.qkv.scale)[0][0]    
-        #(attn.int_repr()[0][0].to(torch.int32) - self.attention_input_zero) @ (v_shape[0][0] ).to(torch.int32) * self.attention_input_scale * self.qkv.scale  # 
+        #attn.dequantize()[0][0]@(v_shape*self.qkv.scale)[0][0]
+        #(attn.int_repr()[0][0].to(torch.int32) - self.attention_input_zero) @ (v_shape[0][0] ).to(torch.int32) * self.attention_input_scale * self.qkv.scale  #
         #(attn.int_repr()[0][0].to(torch.int32) - self.energy_zero) @ (v_shape[0][0] ).to(torch.int32) * self.energy_scale * self.qkv.scale
 
         # P 버퍼에 저장
@@ -1530,16 +1530,16 @@ attn2[0][0].to(torch.int8)-self.p_zp)*self.p_scale
         #        0, 255
         #    ).to(torch.uint8)  # [B, heads, N, N]
         t1=time.perf_counter()
-        print(f"Q*KT+SOFTMAX+v_shape time = {(t1-t0)*1000:.1f}ms")
+        # print(f"Q*KT+SOFTMAX+v_shape time = {(t1-t0)*1000:.1f}ms")
         t0=time.perf_counter()
         x2= self.TPU_Matmul(attn, v_shape, self.attention_input_zero, mode = 'PV')
         t1=time.perf_counter()
-        print(f"PV time = {(t1-t0)*1000:.1f}ms")
+        # print(f"PV time = {(t1-t0)*1000:.1f}ms")
         t0=time.perf_counter()
- 
+
         x2 = x2.transpose(1, 2).contiguous()
-        x2 = x2.reshape(B, N, C) 
-        
+        x2 = x2.reshape(B, N, C)
+
         #wrong1 = np.where(x.int_repr() != x2.int_repr())
         #if len(wrong1[0]) > 4:
         #    for i in range(2):
@@ -1562,8 +1562,8 @@ attn2[0][0].to(torch.int8)-self.p_zp)*self.p_scale
 
         x  = x[:, :197, :]
         t1=time.perf_counter()
-        print(f"CONCAT+PROJ time = {(t1-t0)*1000:.1f}ms")
-        print(f"MHA_TOTAL time = {(t1-t_init)*1000:.1f}ms")
+        # print(f"CONCAT+PROJ time = {(t1-t0)*1000:.1f}ms")
+        # print(f"MHA_TOTAL time = {(t1-t_init)*1000:.1f}ms")
 
         return x
 
@@ -1647,7 +1647,7 @@ def run_sa(
     if isinstance(src1_2, tuple):
         K2, N = src1_2
     else:
-        K2, N = src1_2.shape 
+        K2, N = src1_2.shape
     #Md, Nd = dst1.shape
 
     if K1 != K2:
@@ -1694,9 +1694,9 @@ def start_irq_loop(loop):
 
 class TPULinear(nn.Module):
     def __init__(self,name, x_scale, weight_tensor, bias_tensor,out_scale,out_zp,hw):
-        
+
         super().__init__()
-        self.hw = hw        
+        self.hw = hw
         self.name = name
         #self.out_scale = out_scale
         out_scale_float = float(out_scale)
@@ -1704,7 +1704,7 @@ class TPULinear(nn.Module):
 
         self.out_zp = out_zp
         self.INTERRUPT1 = hw.ip_ol.axi_intc_0
-        if not hasattr(hw, 'irq_loop'): 
+        if not hasattr(hw, 'irq_loop'):
             new_loop = asyncio.new_event_loop()
             hw.irq_loop = new_loop  # <--- 여기서 AttributeError 해결!
             t = threading.Thread(target=start_irq_loop, args=(new_loop,), daemon=True)
@@ -1714,7 +1714,7 @@ class TPULinear(nn.Module):
         if hasattr(weight_tensor, 'int_repr'):
             w_np = weight_tensor.int_repr().detach().cpu().numpy()
             self.w_scale = weight_tensor.q_per_channel_scales()
-            self.w_zero_point = weight_tensor.q_per_channel_zero_points()            
+            self.w_zero_point = weight_tensor.q_per_channel_zero_points()
         elif hasattr(weight_tensor, 'detach'):
             w_np = weight_tensor.detach().cpu().numpy()
             self.w_scale = 1.0  # 기본값
@@ -1725,8 +1725,8 @@ class TPULinear(nn.Module):
             self.w_zero_point = 0
 
         self.out_features = w_np.shape[0] # 예: 2304
-        self.in_features = w_np.shape[1]  # 예: 768        
-        
+        self.in_features = w_np.shape[1]  # 예: 768
+
         if hasattr(self.w_scale, 'detach'):
             # torch.Tensor인 경우
             w_scale_np = self.w_scale.detach().cpu().numpy().astype(np.float32)
@@ -1736,19 +1736,19 @@ class TPULinear(nn.Module):
 
         if w_scale_np.ndim == 0:
             w_scale_np = np.full(self.out_features, float(w_scale_np), dtype=np.float32)
-        x_scale_f   = float(x_scale)    
+        x_scale_f   = float(x_scale)
         out_scale_f = float(self.out_scale)
         m_scale_per_channel = (x_scale_f * w_scale_np / out_scale_f).astype(np.float32)
         if bias_tensor is not None:
             if hasattr(bias_tensor, 'detach'):
-                self.bias = (bias_tensor.detach().cpu().numpy().astype(np.float32) 
+                self.bias = (bias_tensor.detach().cpu().numpy().astype(np.float32)
                             / out_scale_f)
             else:
-                self.bias = (np.asarray(bias_tensor, dtype=np.float32) 
+                self.bias = (np.asarray(bias_tensor, dtype=np.float32)
                             / out_scale_f)
         else:
             self.bias = np.zeros(self.out_features, dtype=np.float32)
-        w_slices = np.vsplit(w_np, 4)        
+        w_slices = np.vsplit(w_np, 4)
         m_slices = np.split(m_scale_per_channel, 4)
         b_slices = np.split(self.bias, 4)
 
@@ -1816,7 +1816,7 @@ class TPULinear(nn.Module):
         )
         t_b = time.perf_counter()
 
-        print(f"copy: {(t_b-t_a)*1000:.2f}ms")
+        # print(f"copy: {(t_b-t_a)*1000:.2f}ms")
         in_features = x.shape[-1]  # 768 or 3072
         padded_input = self.padded_input_map[in_features]
         current_input = padded_input
@@ -1839,10 +1839,10 @@ class TPULinear(nn.Module):
         t2 = time.perf_counter()
         if(status==None):
             read_value = self.INTERRUPT1.read(0x00)
-            print(f"read_value is {read_value}") 
+            print(f"read_value is {read_value}")
             breakpoint()
-            raise RuntimeError(f"TPU HW Timeout! Interrupt status: {hex(read_value)}")        
-         
+            raise RuntimeError(f"TPU HW Timeout! Interrupt status: {hex(read_value)}")
+
         actual_results_elements = padded_rows * (self.src2_list[0][1])
         if status is not None:
             # 안전하게 리스트 컴프리헨션으로 복사
@@ -1893,17 +1893,17 @@ class TPULinear(nn.Module):
         #test2 = test.reshape(x.shape[:-1] + (self.out_features,))
         #test_int = test.int_repr().numpy()
         #wrong = np.where( np.abs(res_np-test_int) > 1)
-        
+
         #if (len(wrong[0]) != 0):
         #    print("wrong detected")
         #    print(res_np[wrong])
         #    print(test_int[wrong])
         #    print(len(wrong[0]))
-            
+
         #    breakpoint()
         #else:
         #    print("✅ correct")
-        
+
         return out_quant
 
 '''

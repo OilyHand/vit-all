@@ -11,10 +11,12 @@ from tqdm import tqdm
 from pynq import Overlay, MMIO, allocate
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+
 from config import config
 from models import get_quant_model
 from models import *
-from models.layers import replace_ln_to_fpga
+from models.layers import replace_ln_to_fpga, collect_ln_params
+from models.layers import fusedResidualLayerNorm, QuantMultiheadAttention
 
 import time
 import pdb
@@ -37,6 +39,81 @@ def make_post_hook(name):
         elapsed = time.perf_counter() - _block_start[name]
         block_times[name].append(elapsed)
     return hook
+
+
+# === Per-module latency profiler ===
+class ModuleLatencyProfiler:
+    """GraphModule 이 실제로 호출하는 call_module 노드마다 forward hook 을 걸어
+    모듈별 latency 를 누적/집계한다 (모듈 코드 수정 불필요, 동기 실행이라 wall-clock 정확)."""
+
+    def __init__(self):
+        self.times    = defaultdict(list)   # target -> [elapsed_sec]
+        self.klass    = {}                  # target -> class name
+        self._start   = {}
+        self._handles = []
+
+    def _pre(self, name):
+        def hook(module, inp):
+            self._start[name] = time.perf_counter()
+        return hook
+
+    def _post(self, name):
+        def hook(module, inp, out):
+            self.times[name].append(time.perf_counter() - self._start[name])
+        return hook
+
+    def attach_called_modules(self, model):
+        """그래프의 call_module 타깃(=실제 실행 단위)에만 훅을 건다."""
+        seen = set()
+        for node in model.graph.nodes:
+            if node.op != "call_module" or node.target in seen:
+                continue
+            seen.add(node.target)
+            try:
+                sub = model.get_submodule(node.target)
+            except AttributeError:
+                continue
+            self.klass[node.target] = type(sub).__name__
+            self._handles.append(sub.register_forward_pre_hook(self._pre(node.target)))
+            self._handles.append(sub.register_forward_hook(self._post(node.target)))
+        return len(self._handles) // 2
+
+    def report(self, skip=1, top=None):
+        rows = []
+        for name, ts in self.times.items():
+            ts = ts[skip:] if len(ts) > skip else ts   # warm-up 배치 제외
+            if not ts:
+                continue
+            n = len(ts)
+            rows.append([name, self.klass.get(name, "?"), n,
+                         sum(ts) / n * 1e3, min(ts) * 1e3, max(ts) * 1e3, sum(ts) * 1e3])
+        if not rows:
+            print("\n[Profiler] no samples collected")
+            return
+        rows.sort(key=lambda r: r[6], reverse=True)     # total 내림차순
+        grand = sum(r[6] for r in rows) or 1e-9
+
+        print("\n=== Per-module latency (total 기준 정렬, warm-up 제외) ===")
+        print(f"{'module':44s} {'type':20s} {'cnt':>5} {'mean':>8} {'min':>8} {'max':>8} {'total':>10} {'%':>6}")
+        for name, kls, n, mean, mn, mx, tot in (rows if top is None else rows[:top]):
+            disp = name if len(name) <= 44 else "..." + name[-41:]
+            print(f"{disp:44s} {kls:20s} {n:>5} {mean:>8.3f} {mn:>8.3f} {mx:>8.3f} {tot:>10.2f} {tot / grand * 100:>5.1f}%")
+
+        type_tot = defaultdict(float)
+        type_cnt = defaultdict(int)
+        for name, kls, n, mean, mn, mx, tot in rows:
+            type_tot[kls] += tot
+            type_cnt[kls] += n
+        print("\n=== Per-type latency (모듈 종류별 합계) ===")
+        print(f"{'type':24s} {'calls':>7} {'total(ms)':>12} {'%':>7}")
+        for kls in sorted(type_tot, key=type_tot.get, reverse=True):
+            print(f"{kls:24s} {type_cnt[kls]:>7} {type_tot[kls]:>12.2f} {type_tot[kls] / grand * 100:>6.1f}%")
+
+    def remove(self):
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ViT INT8 Inference Script")
@@ -68,14 +145,14 @@ if __name__ == "__main__":
     device = torch.device(args.device)
     print(f"[Init] Device: {device}")
     print(f"[Init] Loading Model from: {args.model_path}")
-    
+
     # -------------------------------------------------------------------------
     # 2. Load Data
     # -------------------------------------------------------------------------
     preprocess = torchvision.transforms.Compose([
         torchvision.transforms.Resize((224, 224)),
         torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize((0.5071, 0.4867, 0.4408), 
+        torchvision.transforms.Normalize((0.5071, 0.4867, 0.4408),
                                          (0.2675, 0.2565, 0.2761))
     ])
 
@@ -105,32 +182,41 @@ if __name__ == "__main__":
                             hw=hw,
                             use_hw=args.use_hw,
                             device=args.device)
-    
+
     # traced = torch.fx.symbolic_trace(model)
-    # breakpoint()
-    
+    # with open('orig_code.txt', 'w', encoding='utf-8') as f:
+    #     print(traced.code, file=f)
+
     # for node in model.graph.nodes:
-    #     print(node.name, node.target)
-    #     breakpoint()
+    #     if node.op == 'call_module' and (node.name == 'encoder_ln'):
+    #         print(node.name, node.target, node.op)
+    #         breakpoint()
+
+    # exit()
 
     try:
-        # model = transform_mha_to_tpu(model, hw)
-        # model = transform_conv_to_tpu(quantized_model,hw)
-        # model = transform_quantized_model_to_tpu(quantized_model,hw)
-        model = replace_ln_to_fpga(model, hw)
-        
+        ln_params = collect_ln_params(model, hw)
+        model = transform_mha_to_tpu(model, hw)
+        model = transform_conv_to_tpu(model,hw)
+        model = transform_quantized_model_to_tpu(model,hw)
+        model = replace_ln_to_fpga(model, hw, ln_params)
+
+        with open('log/model.txt', 'w', encoding='utf-8') as f:
+            print(model.code, file=f)
+
         import gc
         gc.collect()
 
     except Exception as e:
         traceback.print_exc()
-    
+        exit()
+
     except KeyboardInterrupt:
         del hw
         print("[Keyboard Interrupt] Exit")
         exit()
-        
-    breakpoint()
+
+    # breakpoint()
 
     # -------------------------------------------------------------------------
     # 4. Inference Loop
@@ -152,11 +238,16 @@ if __name__ == "__main__":
 
     print(f"Registered {len(hooks)} hooks")
 
+    # 그래프가 실제 호출하는 모든 call_module 에 per-module 프로파일러 부착
+    mod_prof = ModuleLatencyProfiler()
+    n_mods = mod_prof.attach_called_modules(model)
+    print(f"[Profiler] Hooked {n_mods} call_module targets")
+
     correct = 0
     total = 0
     total_inference_time = 0.0
 
-    
+
     print("===============================================================")
     print(" ***             Starting Inference on TestSet             *** ")
     print("===============================================================")
@@ -166,7 +257,7 @@ if __name__ == "__main__":
     # from pynq import get_rails
 
     # rails = get_rails()
-    # recorder = DataRecorder( rails['12V'].power, rails['INT'].power, rails['1V2'].power, rails['1V8'].power) 
+    # recorder = DataRecorder( rails['12V'].power, rails['INT'].power, rails['1V2'].power, rails['1V8'].power)
 
     # with recorder.record(0.001):
     #     time.sleep(2)  # 아무것도 안하는 상태
@@ -190,13 +281,13 @@ if __name__ == "__main__":
                 start_time = time.perf_counter()
                 preds = model(imgs)
                 end_time = time.perf_counter()
-            
+
                 # df = recorder.frame
                 # power_12v  = df['12V_power'].mean()
                 # power_int  = df['INT_power'].mean()
                 # power_1v2  = df['1V2_power'].mean()
                 # power_1v8  = df['1V8_power'].mean()
-                
+
 
                 # 배치 처리 시간 누적
                 batch_time = end_time - start_time
@@ -207,20 +298,21 @@ if __name__ == "__main__":
                 pred_cls = preds.argmax(dim=1)
                 correct += (pred_cls == labels).sum().item()
                 total += labels.size(0)
-                
+
                 # 현재 정확도와 평균 레이턴시 계산
                 current_acc = correct / total
                 latency_sec = (batch_time)
-                avg_latency_sec = (total_inference_time / total)*1000             
-                best_latency  = min(best_latency,  (batch_time * 1000) / labels.size(0)) 
+                avg_latency_sec = (total_inference_time / total)*1000
+                best_latency  = min(best_latency,  (batch_time * 1000) / labels.size(0))
 
                 print(f"Acc: {current_acc:.4f} | "
-                  f"AvgTime: {avg_latency_sec:.2f}ms | "
-                  f"BestTime: {best_latency:.2f}ms | ")
-                #   f"12V: {power_12v:.2f}W | "
+                      f"Current Latency: {(latency_sec*1000)/labels.size(0):.2f}ms | "
+                      f"Average Latency: {avg_latency_sec:.2f}ms | "
+                      f"BestTime: {best_latency:.2f}ms | ")
+                #    f"12V: {power_12v:.2f}W | "
                 #   f"INT: {power_int:.2f}W | "
                 #   f"1V2: {power_1v2:.2f}W | "
-                #   f"1V8: {power_1v8:.2f}W | ") 
+                #   f"1V8: {power_1v8:.2f}W | ")
 
             # === 최종 block별 평균 출력 ===
             print("\n=== Per-block timing (avg) ===")
@@ -229,7 +321,7 @@ if __name__ == "__main__":
                 if ts:
                     avg_ms = sum(ts) / len(ts) * 1000
                     print(f"  {name}: {avg_ms:.3f} ms")
-            
+
             # 전체 transformer 평균
             all_block_times = [t for ts in block_times.values() for t in ts]
             if all_block_times:
@@ -242,18 +334,21 @@ if __name__ == "__main__":
 
     except Exception as e:
         traceback.print_exc()
-    
+
     finally:
+        # 모듈별 latency 요약 (성공/중단/예외 관계없이 항상 출력)
+        mod_prof.report(skip=1, top=40)
         for h in hooks:
             h.remove()
-        print(f"\n[Cleanup] Removed {len(hooks)} hooks")
+        mod_prof.remove()
+        print(f"\n[Cleanup] Removed {len(hooks)} block hooks + module profiler hooks")
 
     # -------------------------------------------------------------------------
     # 5. Final Report
     # -------------------------------------------------------------------------
     final_acc = correct / total
     final_avg_latency_ms = (total_inference_time / total) * 1000
-    
+
     print("\n===============================================================")
     print(f" [Result] Final Accuracy: {final_acc:.4f} ({correct}/{total})")
     print(f" [Result] Avg Latency   : {final_avg_latency_ms:.4f} ms/sample")
